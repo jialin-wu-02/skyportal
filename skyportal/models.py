@@ -101,7 +101,7 @@ Token.groups = token_groups
 
 class Source(Base):
     id = sa.Column(sa.String, primary_key=True)
-    is_source = sa.Column(sa.Boolean, default=False)
+    is_source = sa.Column(sa.Boolean, default=True)
     is_candidate = sa.Column(sa.Boolean, default=True)
 
     # TODO should this column type be decimal? fixed-precison numeric
