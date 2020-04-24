@@ -16,23 +16,32 @@ from baselayer.app.models import (init_db, join_model, Base, DBSession, ACL,
 from . import schema
 
 
-def is_owned_by(self, user_or_token):
+def is_owned_by(self, user_or_token, groups_attr="groups"):
     """Generic ownership logic for any `skyportal` ORM model.
 
     Models with complicated ownership logic should implement their own method
     instead of adding too many additional conditions here.
+
+    Parameters
+    ----------
+    user_or_token : User or Token object
+        The user or token whose access rights are to be checked.
+    groups_attr : str, optional
+        The object's relevant groups attribute name, e.g. "groups" or "candidate_groups".
+        Defaults to "groups".
     """
     if hasattr(self, 'tokens'):
         return (user_or_token in self.tokens)
-    elif hasattr(self, 'groups'):
-        return bool(set(self.groups) & set(user_or_token.groups))
-    elif hasattr(self, 'users'):
+    if hasattr(self, groups_attr):
+        return bool(set(getattr(self, groups_attr)) & set(user_or_token.groups))
+    if hasattr(self, 'users'):
         if hasattr(user_or_token, 'created_by'):
             if user_or_token.created_by in self.users:
                 return True
         return (user_or_token in self.users)
-    else:
-        raise NotImplementedError(f"{type(self).__name__} object has no owner")
+    raise NotImplementedError(f"{type(self).__name__} object has no owner")
+
+
 Base.is_owned_by = is_owned_by
 
 
@@ -47,6 +56,7 @@ class Group(Base):
     name = sa.Column(sa.String, unique=True, nullable=False)
 
     sources = relationship('Source', secondary='group_sources')
+    candidates = relationship("Source", secondary="group_candidates")
     streams = relationship('Stream', secondary='stream_groups',
                            back_populates='groups')
     telescopes = relationship('Telescope', secondary='group_telescopes')
@@ -80,14 +90,20 @@ User.group_users = relationship('GroupUser', back_populates='user',
 User.groups = relationship('Group', secondary='group_users',
                            back_populates='users')
 
+
 @property
 def token_groups(self):
     return self.created_by.groups
+
+
 Token.groups = token_groups
 
 
 class Source(Base):
     id = sa.Column(sa.String, primary_key=True)
+    is_source = sa.Column(sa.Boolean, default=False)
+    is_candidate = sa.Column(sa.Boolean, default=True)
+
     # TODO should this column type be decimal? fixed-precison numeric
     ra = sa.Column(sa.Float)
     dec = sa.Column(sa.Float)
@@ -114,7 +130,7 @@ class Source(Base):
 
     score = sa.Column(sa.Float, nullable=True)
 
-    ## pan-starrs
+    # pan-starrs
     sgmag1 = sa.Column(sa.Float, nullable=True)
     srmag1 = sa.Column(sa.Float, nullable=True)
     simag1 = sa.Column(sa.Float, nullable=True)
@@ -134,10 +150,17 @@ class Source(Base):
     tns_name = sa.Column(sa.Unicode, nullable=True)
 
     groups = relationship('Group', secondary='group_sources')
+    candidate_groups = relationship("Group", secondary="group_candidates")
     comments = relationship('Comment', back_populates='source',
+                            primaryjoin="comments.c.source_id == sources.c.id",
                             cascade='save-update, merge, refresh-expire, expunge',
                             passive_deletes=True,
                             order_by="Comment.created_at")
+    candidate_comments = relationship("Comment", back_populates="candidate",
+                                      primaryjoin="comments.c.candidate_id == sources.c.id",
+                                      cascade="save-update, merge, refresh-expire, expunge",
+                                      passive_deletes=True,
+                                      order_by="Comment.created_at")
     photometry = relationship('Photometry', back_populates='source',
                               cascade='save-update, merge, refresh-expire, expunge',
                               single_parent=True,
@@ -188,6 +211,13 @@ User.sources = relationship('Source', backref='users',
                             secondary='join(Group, group_sources).join(group_users)',
                             primaryjoin='group_users.c.user_id == users.c.id')
 
+GroupSource.saved_as_source_by_id = sa.Column(sa.ForeignKey("users.id"), nullable=True)
+GroupSource.saved_as_source_by = relationship(
+    "User", foreign_keys=[GroupSource.saved_as_source_by_id], backref="saved_sources")
+GroupSource.saved_as_source_at_time = sa.Column(ArrowType, nullable=True)
+
+GroupCandidate = join_model("group_candidates", Group, Source)
+
 
 class SourceView(Base):
     source_id = sa.Column(sa.ForeignKey('sources.id', ondelete='CASCADE'),
@@ -231,7 +261,7 @@ class Instrument(Base):
 class Comment(Base):
     text = sa.Column(sa.String, nullable=False)
     ctype = sa.Column(sa.Enum('text', 'redshift', 'classification',
-                             name='comment_types', validate_strings=True))
+                              name='comment_types', validate_strings=True))
 
     attachment_name = sa.Column(sa.String, nullable=True)
     attachment_type = sa.Column(sa.String, nullable=True)
@@ -240,13 +270,19 @@ class Comment(Base):
     origin = sa.Column(sa.String, nullable=True)
     author = sa.Column(sa.String, nullable=False)
     source_id = sa.Column(sa.ForeignKey('sources.id', ondelete='CASCADE'),
-                          nullable=False, index=True)
-    source = relationship('Source', back_populates='comments')
+                          nullable=True, index=True)
+    source = relationship('Source', foreign_keys=[source_id],
+                          back_populates='comments')
+    candidate_id = sa.Column(
+        sa.ForeignKey("sources.id", ondelete="CASCADE"), nullable=True, index=True
+    )
+    candidate = relationship("Source", foreign_keys=[candidate_id],
+                             back_populates="candidate_comments")
 
 
 class Photometry(Base):
     __tablename__ = 'photometry'
-    observed_at = sa.Column(ArrowType) # iso date
+    observed_at = sa.Column(ArrowType)  # iso date
     mjd = sa.Column(sa.Float)  # mjd date
     time_format = sa.Column(sa.String, default='iso')
     time_scale = sa.Column(sa.String, default='utc')
@@ -263,7 +299,7 @@ class Photometry(Base):
     mag_nearest_source = sa.Column(sa.Float, nullable=True)
     e_mag_nearest_source = sa.Column(sa.Float, nullable=True)
 
-    ## external values
+    # external values
     score = sa.Column(sa.Float, nullable=True)  # RB
     candid = sa.Column(sa.BigInteger, nullable=True)  # candidate ID
     altdata = sa.Column(JSONB)
@@ -308,7 +344,7 @@ class Spectrum(Base):
                    observed_at=observed_at)
 
 
-#def format_public_url(context):
+# def format_public_url(context):
 #    """TODO migrate this to broker tools"""
 #    file_uri = context.current_parameters.get('file_uri')
 #    if file_uri is None:
